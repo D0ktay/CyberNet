@@ -1,0 +1,4 @@
+/dev/cu.BarlasadlkiiyeaitBudsFE
+/dev/cu.BLTH
+/dev/cu.Bluetooth-Incoming-Port
+/dev/cu.EmkonAlfaAirPodsMax

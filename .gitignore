@@ -1,0 +1,17 @@
+
+radar_env/
+
+__pycache__/
+
+*.pyc
+
+*.pyo
+
+data/
+
+*.h5
+
+*.pkl
+
+*.npy
+
