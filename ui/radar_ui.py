@@ -197,6 +197,12 @@ class Radar3x3UI:
         self.wave_history     = [0.0] * 200
         self._wave_phase      = 0.0
 
+        # ── Spektral band geçmişi (60 frame smooth) ───────────────────────────
+        self._band_low   = [0.0] * 60   # 0.1–0.5 Hz solunum
+        self._band_mid   = [0.0] * 60   # 0.5–2 Hz yürüyüş
+        self._band_high  = [0.0] * 60   # 2–10 Hz hızlı hareket
+        self._band_rect  = pygame.Rect(0, 0, 1, 1)
+
         # ── Alt CSI heatmap (sol panelde bağımsız grafik) ─────────────────────
         self._csi_heatmap_data = np.zeros((8, 16), dtype=np.float32)
         self._csi_hmap_rect    = pygame.Rect(0, 0, 1, 1)
@@ -569,6 +575,34 @@ class Radar3x3UI:
             amp += random.choice([-1, 1]) * random.randint(20, 45)
 
         self.wave_history.append(float(np.clip(amp, 20, 180)))
+        self._update_spectral_bands(dt)
+
+    def _update_spectral_bands(self, dt: float):
+        activity = self.skeleton.activity
+        t = pygame.time.get_ticks() * 0.001
+        # Simülasyonda her bant aktiviteye göre farklı enerji seviyesi alır.
+        # Gerçek ESP32 verisinde bunlar Butterworth band-pass çıktısından gelir.
+        if activity == "walking":
+            low  = 15 + math.sin(t * 0.3) * 8 + random.gauss(0, 3)
+            mid  = 72 + math.sin(t * 1.2) * 18 + random.gauss(0, 8)
+            high = 45 + math.sin(t * 4.5) * 20 + random.gauss(0, 10)
+        elif activity == "sitting":
+            low  = 42 + math.sin(t * 0.22) * 14 + random.gauss(0, 4)
+            mid  = 18 + math.sin(t * 0.6) * 8  + random.gauss(0, 4)
+            high = 8  + random.gauss(0, 3)
+        else:  # standing
+            low  = 28 + math.sin(t * 0.18) * 10 + random.gauss(0, 3)
+            mid  = 22 + math.sin(t * 0.5) * 7   + random.gauss(0, 4)
+            high = 12 + random.gauss(0, 3)
+
+        # Smooth geçiş: mevcut son değere doğru lerp
+        alpha = min(1.0, dt * 6.0)
+        last_low  = self._band_low[-1]
+        last_mid  = self._band_mid[-1]
+        last_high = self._band_high[-1]
+        self._band_low.pop(0);  self._band_low.append(float(np.clip(last_low  + (low  - last_low)  * alpha, 0, 100)))
+        self._band_mid.pop(0);  self._band_mid.append(float(np.clip(last_mid  + (mid  - last_mid)  * alpha, 0, 100)))
+        self._band_high.pop(0); self._band_high.append(float(np.clip(last_high + (high - last_high) * alpha, 0, 100)))
 
     def _update_csi_heatmap(self):
         t = pygame.time.get_ticks() * 0.001
@@ -871,6 +905,26 @@ class Radar3x3UI:
                 surf.fill(fill)
             self.screen.blit(surf, (rect.x + 2, rect.y + 2))
 
+    def _zone_confidence(self, label: str) -> Optional[float]:
+        """ML proba buffer'dan bu zone'un ortalama olasılığını döndürür (0-1), yoksa None."""
+        if not self._ml_proba_buffer or not self._ml_classes:
+            return None
+        avg = np.mean(np.stack(self._ml_proba_buffer), axis=0)
+        total = self.grid_rows * self.grid_cols
+        zone_map = {}
+        for idx in range(total):
+            r = idx // self.grid_cols
+            c = idx % self.grid_cols
+            lbl = self.grid_labels[r][c]
+            if idx == 0:
+                zone_map[lbl] = "zone_A"
+            elif idx == total - 1:
+                zone_map[lbl] = "zone_B"
+        ml_label = zone_map.get(label)
+        if ml_label and ml_label in self._ml_classes:
+            return float(avg[self._ml_classes.index(ml_label)])
+        return None
+
     # ── 2D Grid Kutuları ──────────────────────────────────────────────────────
     def _draw_grid_panel(self):
         for label, rect in self.regions.items():
@@ -907,6 +961,15 @@ class Radar3x3UI:
                 dim_s = self.f_xs.render(f"{cw:.1f}×{cl:.1f}m", True, TEXT_DIM)
                 self.screen.blit(dim_s, (rect.x + 4, rect.y + 4))
 
+            # Zone confidence — ML olasılığı varsa sağ alt köşeye yaz
+            conf = self._zone_confidence(label)
+            if conf is not None and rect.height > 40:
+                conf_pct = int(conf * 100)
+                conf_col = (ACTIVE_COLOR if conf_pct > 60
+                            else (WARN_YELLOW if conf_pct > 30 else TEXT_DIM))
+                conf_s = self.f_xs.render(f"{conf_pct}%", True, conf_col)
+                self.screen.blit(conf_s, (rect.right - conf_s.get_width() - 4, rect.y + 4))
+
         # Avatar (2D grid üzerinde)
         ax, ay = int(self.avatar_x), int(self.avatar_y)
         halo = pygame.Surface((56, 56), pygame.SRCALPHA)
@@ -926,36 +989,71 @@ class Radar3x3UI:
                 self.screen.blit(asurf, (ax - 10, ay - 28))
 
     # ── CSI Dalga Grafiği ─────────────────────────────────────────────────────
+    def _signal_morphology(self) -> tuple:
+        """Son 30 frame'den varyans ve trend hesaplayarak sinyal durumunu döndürür."""
+        if len(self.wave_history) < 30:
+            return "ANALYZING...", TEXT_DIM
+        recent = self.wave_history[-30:]
+        variance = float(np.var(recent))
+        mean_amp = float(np.mean(recent))
+        trend = recent[-1] - recent[0]
+
+        if variance > 280:
+            return "HIGH TURBULENCE  — MOTION DETECTED", WARN_ORANGE
+        if variance > 120:
+            if trend > 8:
+                return "RISING AMPLITUDE — APPROACHING", WARN_YELLOW
+            if trend < -8:
+                return "FALLING AMPLITUDE — RECEDING", NEON_CYAN
+            return "MODERATE VARIANCE — ACTIVE PRESENCE", GRAPH_COLOR
+        if mean_amp < 55:
+            return "LOW AMPLITUDE — AREA CLEAR", TEXT_DIM
+        return "STABLE SIGNAL — STATIONARY TARGET", ACTIVE_COLOR
+
     def _draw_wave_graph(self):
         r = self._graph_rect
+        # Paneli wave bölgesi + band bölgesi olarak ikiye böl
+        band_h   = 32
+        wave_h   = r.height - band_h - 4
+        wave_r   = pygame.Rect(r.x, r.y, r.width, wave_h)
+        band_r   = pygame.Rect(r.x, r.y + wave_h + 4, r.width, band_h)
+        self._band_rect = band_r
+
         pygame.draw.rect(self.screen, PANEL_DARK, r, border_radius=6)
         pygame.draw.rect(self.screen, BORDER_COLOR, r, 1, border_radius=6)
 
-        hdr = self.f_sm.render(
-            "// LIVE CSI SIGNAL  [SUB-CARRIER AMPLITUDE]", True, GRAPH_COLOR)
-        self.screen.blit(hdr, (r.x + 8, r.y + 5))
+        # Başlık
+        hdr = self.f_sm.render("// LIVE CSI SIGNAL  [SUB-CARRIER AMPLITUDE]", True, GRAPH_COLOR)
+        self.screen.blit(hdr, (wave_r.x + 8, wave_r.y + 5))
 
+        # Morfoloji etiketi — sağ üst
+        morph_label, morph_col = self._signal_morphology()
+        morph_surf = self.f_xs.render(morph_label, True, morph_col)
+        self.screen.blit(morph_surf, (wave_r.right - morph_surf.get_width() - 8, wave_r.y + 6))
+
+        # Yatay ızgara çizgileri
         for i, pct in enumerate((0.25, 0.5, 0.75)):
-            gy = r.y + int(r.height * pct)
-            pygame.draw.line(self.screen, (22, 32, 46), (r.x + 2, gy), (r.right - 2, gy))
+            gy = wave_r.y + int(wave_h * pct)
+            pygame.draw.line(self.screen, (22, 32, 46), (wave_r.x + 2, gy), (wave_r.right - 2, gy))
             val = int(180 * (1 - pct) + 20 * pct)
             lbl = self.f_xs.render(str(val), True, TEXT_DIM)
-            self.screen.blit(lbl, (r.x + 2, gy - 8))
+            self.screen.blit(lbl, (wave_r.x + 2, gy - 8))
 
+        # Dalga çizimi
         pts = []
-        step = r.width / max(len(self.wave_history) - 1, 1)
+        step = wave_r.width / max(len(self.wave_history) - 1, 1)
         for i, amp in enumerate(self.wave_history):
-            x = r.x + i * step
-            y = r.y + r.height * 0.82 - amp * 0.35
-            y = max(r.y + 18, min(y, r.bottom - 6))
+            x = wave_r.x + i * step
+            y = wave_r.y + wave_h * 0.82 - amp * (wave_h * 0.55 / 160)
+            y = max(wave_r.y + 18, min(y, wave_r.bottom - 4))
             pts.append((int(x), int(y)))
 
         if len(pts) > 1:
-            fill_pts = [(r.x, r.bottom - 4)] + pts + [(r.right, r.bottom - 4)]
-            fill_surf = pygame.Surface((r.width, r.height), pygame.SRCALPHA)
-            offset_pts = [(p[0] - r.x, p[1] - r.y) for p in fill_pts]
+            fill_pts = [(wave_r.x, wave_r.bottom - 4)] + pts + [(wave_r.right, wave_r.bottom - 4)]
+            fill_surf = pygame.Surface((wave_r.width, wave_h), pygame.SRCALPHA)
+            offset_pts = [(p[0] - wave_r.x, p[1] - wave_r.y) for p in fill_pts]
             pygame.draw.polygon(fill_surf, (0, 191, 255, 22), offset_pts)
-            self.screen.blit(fill_surf, (r.x, r.y))
+            self.screen.blit(fill_surf, (wave_r.x, wave_r.y))
 
             shadow_pts = [(x, y + 2) for x, y in pts]
             pygame.draw.lines(self.screen, GRAPH_DIM, False, shadow_pts, 1)
@@ -970,7 +1068,48 @@ class Radar3x3UI:
         last_jump = abs(self.wave_history[-1] - self.wave_history[-2]) if len(self.wave_history) >= 2 else 0
         if last_jump > 25:
             jlbl = self.f_xs.render(f"PHASE JUMP +{last_jump:.0f}", True, WARN_ORANGE)
-            self.screen.blit(jlbl, (r.x + r.width - 110, r.y + 8))
+            self.screen.blit(jlbl, (wave_r.x + wave_r.width - 110, wave_r.y + wave_h - 14))
+
+        # ── Spektral Band Çubukları ────────────────────────────────────────────
+        self._draw_spectral_bands(band_r)
+
+    def _draw_spectral_bands(self, r: pygame.Rect):
+        pygame.draw.line(self.screen, BORDER_COLOR,
+                         (r.x + 2, r.y), (r.right - 2, r.y))
+
+        bands = [
+            ("RESP", self._band_low[-1],  (80, 200, 255)),   # mavi — solunum
+            ("WALK", self._band_mid[-1],  (255, 210, 0)),    # sarı — yürüyüş
+            ("MOVE", self._band_high[-1], (255, 80, 120)),   # kırmızı — hızlı
+        ]
+
+        label_w = 32
+        gap      = 6
+        bar_area_w = (r.width - label_w * len(bands) - gap * (len(bands) + 1)) // len(bands)
+        bar_max_h  = r.height - 14
+
+        for i, (name, val, col) in enumerate(bands):
+            bx = r.x + gap + i * (bar_area_w + label_w + gap)
+            # Etiket
+            lbl = self.f_xs.render(name, True, col)
+            self.screen.blit(lbl, (bx, r.y + 2))
+            # Çubuk arka planı
+            bar_bg = pygame.Rect(bx, r.y + 12, bar_area_w + label_w - 2, bar_max_h)
+            pygame.draw.rect(self.screen, (14, 20, 30), bar_bg, border_radius=2)
+            # Dolu kısım
+            fill_h = int(bar_max_h * val / 100.0)
+            if fill_h > 0:
+                fill_rect = pygame.Rect(bx, r.bottom - fill_h - 2, bar_area_w + label_w - 2, fill_h)
+                # Gradient efekti: üst kısım parlak, alt kısım sönük
+                glow_surf = pygame.Surface((fill_rect.width, fill_rect.height), pygame.SRCALPHA)
+                for gy in range(fill_rect.height):
+                    alpha = int(80 + 160 * (1 - gy / max(fill_rect.height, 1)))
+                    pygame.draw.line(glow_surf, (*col, alpha),
+                                     (0, gy), (fill_rect.width, gy))
+                self.screen.blit(glow_surf, (fill_rect.x, fill_rect.y))
+            # Değer metni
+            pct_s = self.f_xs.render(f"{int(val)}", True, col)
+            self.screen.blit(pct_s, (bx + bar_area_w + label_w - pct_s.get_width() - 2, r.y + 2))
 
     # ── CSI Heatmap Paneli ────────────────────────────────────────────────────
     def _draw_csi_heatmap_panel(self):
