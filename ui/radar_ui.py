@@ -207,6 +207,17 @@ class Radar3x3UI:
         self._csi_heatmap_data = np.zeros((8, 16), dtype=np.float32)
         self._csi_hmap_rect    = pygame.Rect(0, 0, 1, 1)
 
+        # ── 3 RX anten kanalı (Birleşik RX modülü: sol -45° / orta 0° / sağ +45°)
+        # İnsan-okunur filtreleme: ham CSI yerine durum etiketi + seviye gösterilir.
+        self._rx_channels = [
+            {"label": "RX-1  SOL   (-45°)", "history": [0.0] * 50,
+             "color": GRAPH_COLOR,  "status": "ANALİZ...", "status_color": TEXT_DIM},
+            {"label": "RX-2  ORTA  (0°)",   "history": [0.0] * 50,
+             "color": ACTIVE_COLOR, "status": "ANALİZ...", "status_color": TEXT_DIM},
+            {"label": "RX-3  SAĞ   (+45°)", "history": [0.0] * 50,
+             "color": NEON_PURPLE,  "status": "ANALİZ...", "status_color": TEXT_DIM},
+        ]
+
         # ── Telemetri / Diagnostics ────────────────────────────────────────────
         self.cqi        = 72
         self.csi_rate   = 320
@@ -534,6 +545,7 @@ class Radar3x3UI:
             self.avatar_y += (rect.centery - self.avatar_y) * 0.14
 
         self._update_wave(dt)
+        self._update_rx_channels(dt)
 
         if self._frame % 3 == 0:
             self._update_csi_heatmap()
@@ -603,6 +615,43 @@ class Radar3x3UI:
         self._band_low.pop(0);  self._band_low.append(float(np.clip(last_low  + (low  - last_low)  * alpha, 0, 100)))
         self._band_mid.pop(0);  self._band_mid.append(float(np.clip(last_mid  + (mid  - last_mid)  * alpha, 0, 100)))
         self._band_high.pop(0); self._band_high.append(float(np.clip(last_high + (high - last_high) * alpha, 0, 100)))
+
+    def _update_rx_channels(self, dt: float):
+        """Birleşik RX modülündeki 3 antenden gelen sinyali insan-okunur hale filtrele.
+
+        Gerçek donanımda her kanal kendi ESP32'sinden gelen CSI ortalama genliğini
+        taşır; burada her antenin farklı açıdan baktığı için birbirinden bağımsız
+        bir "görünüm" yakaladığını simüle etmek üzere faz farkı kullanılıyor.
+        """
+        activity = self.skeleton.activity
+        t = pygame.time.get_ticks() * 0.001
+        phase_offsets = (0.0, 1.7, 3.3)
+        base_levels = {"walking": 92, "sitting": 64, "standing": 74}
+        base = base_levels.get(activity, 70)
+
+        for i, ch in enumerate(self._rx_channels):
+            ph = phase_offsets[i]
+            wobble = math.sin(t * 1.4 + ph) * 16 + math.sin(t * 4.1 + ph * 1.3) * 8
+            noise  = random.gauss(0, 5 if activity == "walking" else 3)
+            target = float(np.clip(base + wobble + noise, 15, 175))
+
+            last  = ch["history"][-1]
+            alpha = min(1.0, dt * 5.0)
+            ch["history"].pop(0)
+            ch["history"].append(float(last + (target - last) * alpha))
+
+            # Ham sayıları değil, anlaşılır bir durum etiketi göster
+            recent = ch["history"][-20:]
+            var  = float(np.var(recent))
+            mean = float(np.mean(recent))
+            if var > 110:
+                ch["status"], ch["status_color"] = "HAREKETLİ", WARN_ORANGE
+            elif mean < 45:
+                ch["status"], ch["status_color"] = "BOŞ ALAN", TEXT_DIM
+            elif var > 40:
+                ch["status"], ch["status_color"] = "AKTİF", GRAPH_COLOR
+            else:
+                ch["status"], ch["status_color"] = "DURGUN", ACTIVE_COLOR
 
     def _update_csi_heatmap(self):
         t = pygame.time.get_ticks() * 0.001
@@ -1254,33 +1303,93 @@ class Radar3x3UI:
             True, WARN_YELLOW)
         self.screen.blit(zone_badge, (LEFT_W + 10, 46))
 
-        sub_h = TOTAL_H - 90
-        sub   = pygame.Surface((VIEW3D_W, sub_h))
+        # ── Alan ikiye bölünüyor: üst yarı = 3D iskelet, alt yarı = 3 RX anten paneli
+        area_top = 66
+        area_h   = TOTAL_H - area_top - 8
+        skel_h   = area_h // 2
+        rx_h     = area_h - skel_h - 12
+
+        sub = pygame.Surface((VIEW3D_W, skel_h))
+        # Projeksiyon vp_w/vp_h sabitlerine göre hesaplanıyor — küçülen yüzey
+        # için geçici olarak gerçek boyuta eşitleyip sonra eski haline döndür.
+        prev_vp_h = self.renderer3d.vp_h
+        self.renderer3d.vp_h = skel_h
         self.renderer3d.render_fallback_to_surface(
             sub, [self.skeleton],
             (self.current_row, self.current_col),
             grid_dims=(self.grid_rows, self.grid_cols))
-        self.screen.blit(sub, (LEFT_W, 66))
+        self.renderer3d.vp_h = prev_vp_h
+        self.screen.blit(sub, (LEFT_W, area_top))
+
+        skel_bottom = area_top + skel_h
 
         act     = self.skeleton.activity.upper()
         act_col = (ACTIVE_COLOR if act in ("STANDING", "WALKING")
                    else (GRAPH_COLOR if act == "SITTING" else TEXT_DIM))
         badge   = self.f_body.render(f"[ {act} ]", True, act_col)
         self.screen.blit(badge, badge.get_rect(
-            centerx=LEFT_W + VIEW3D_W // 2, y=TOTAL_H - 32))
+            centerx=LEFT_W + VIEW3D_W // 2, y=skel_bottom - 26))
 
         if self._skel_walk_timer > 0:
             alpha = int(180 * (self._skel_walk_timer / 1.2))
             t     = pygame.time.get_ticks() * 0.002
             for i in range(6):
                 fx  = LEFT_W + VIEW3D_W // 2 + int(math.sin(t + i) * 30)
-                fy  = TOTAL_H - 90 - i * 14
+                fy  = skel_bottom - 60 - i * 14
                 dot = pygame.Surface((8, 4), pygame.SRCALPHA)
                 dot.fill((*ACTIVE_COLOR, alpha // (i + 1)))
                 self.screen.blit(dot, (fx - 4, fy - 2))
 
-        # Vital Signs mini panel — viewport sol alt köşesine
-        self._draw_vital_signs_mini(LEFT_W + 6, TOTAL_H - 210)
+        # Vital Signs mini panel — iskelet alanının sol alt köşesine
+        self._draw_vital_signs_mini(LEFT_W + 6, skel_bottom - 140)
+
+        # ── Alt yarı: Birleşik RX modülü — 3 anten kanalı, filtrelenmiş gösterim
+        rx_rect = pygame.Rect(LEFT_W + 8, skel_bottom + 12, VIEW3D_W - 16, rx_h)
+        self._draw_rx_channels_panel(rx_rect)
+
+    # ─── Birleşik RX Modülü — 3 Anten Kanalı (filtrelenmiş, insan-okunur) ────
+    def _draw_rx_channels_panel(self, r: pygame.Rect):
+        bg = pygame.Surface((r.width, r.height), pygame.SRCALPHA)
+        bg.fill((6, 12, 20, 205))
+        self.screen.blit(bg, (r.x, r.y))
+        pygame.draw.rect(self.screen, BORDER_COLOR, r, 1, border_radius=4)
+
+        hdr = self.f_xs.render(
+            "// BİRLEŞİK RX MODÜLÜ — 3 ANTEN AKIŞI  [filtrelenmiş]", True, TEXT_DIM)
+        self.screen.blit(hdr, (r.x + 8, r.y + 6))
+
+        top_y   = r.y + 24
+        strip_h = (r.height - 30) // 3
+
+        for i, ch in enumerate(self._rx_channels):
+            sy    = top_y + i * strip_h
+            strip = pygame.Rect(r.x + 6, sy, r.width - 12, strip_h - 6)
+            pygame.draw.rect(self.screen, PANEL_DARK, strip, border_radius=3)
+            pygame.draw.rect(self.screen, ch["color"], strip, 1, border_radius=3)
+
+            lbl = self.f_sm.render(ch["label"], True, TEXT_BRIGHT)
+            self.screen.blit(lbl, (strip.x + 8, strip.y + 5))
+
+            st_s = self.f_xs.render(f"[ {ch['status']} ]", True, ch["status_color"])
+            self.screen.blit(st_s, (strip.x + 8, strip.y + 19))
+
+            lvl_s = self.f_xs.render(f"{ch['history'][-1]:5.1f}", True, ch["color"])
+            self.screen.blit(lvl_s, (strip.right - 40, strip.y + 5))
+
+            graph_rect = pygame.Rect(strip.x + 132, strip.y + 6,
+                                     strip.width - 144, strip.height - 12)
+            pygame.draw.rect(self.screen, (5, 8, 13), graph_rect)
+
+            hist = ch["history"]
+            step = graph_rect.width / max(len(hist) - 1, 1)
+            pts  = []
+            for j, v in enumerate(hist):
+                x = int(graph_rect.x + j * step)
+                y = int(graph_rect.bottom - (v / 180.0) * graph_rect.height)
+                y = max(graph_rect.y + 1, min(y, graph_rect.bottom - 1))
+                pts.append((x, y))
+            if len(pts) > 1:
+                pygame.draw.lines(self.screen, ch["color"], False, pts, 2)
 
     # ─── Vital Signs Mini Panel ───────────────────────────────────────────────
     def _draw_vital_signs_mini(self, px: int, py: int):

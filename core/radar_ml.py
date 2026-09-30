@@ -36,8 +36,21 @@ class RadarML:
         
         # 1. Veriyi Oku
         df = pd.read_csv(DATA_PATH)
-        X = df.drop(columns=['Bölge_Etiketi'])
-        y = df['Bölge_Etiketi']
+
+        # Etiket sütunu farklı isimlerde olabilir; birkaç yaygın alternatifi dene
+        possible_label_cols = ['Bölge_Etiketi', 'label', 'zone', 'Zone', 'Bölge']
+        label_col = None
+        for col in possible_label_cols:
+            if col in df.columns:
+                label_col = col
+                break
+
+        if label_col is None:
+            print(f"\n❌ [EĞİTİM HATASI]: Beklenen etiket sütunu bulunamadı. Mevcut sütunlar: {list(df.columns)}")
+            return False
+
+        X = df.drop(columns=[label_col])
+        y = df[label_col]
         
         # 2. Veriyi Parçala (%80 Eğitim, %20 Test)
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
